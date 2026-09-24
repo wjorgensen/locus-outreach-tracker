@@ -1,0 +1,8 @@
+# never publish prospect data or DM texts
+seed_data.json
+*.db
+# local dev
+.venv/
+__pycache__/
+*.pyc
+.env
