@@ -3,6 +3,7 @@ Single-service Flask app, SQLite storage. Built for BuildWithLocus deploy.
 """
 import json
 import os
+import secrets
 import sqlite3
 from datetime import datetime, timezone
 from functools import wraps
@@ -57,6 +58,21 @@ def init_db():
             FOREIGN KEY(prospect_id) REFERENCES prospects(id)
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )"""
+    )
+    # API token for scripts/CLIs: auto-generated once, persisted in the DB so
+    # it survives restarts. Wes copies it from /settings; we never log it.
+    tok = conn.execute("SELECT value FROM settings WHERE key='api_token'").fetchone()
+    if not tok or not tok["value"]:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('api_token', ?)",
+            (secrets.token_urlsafe(32),),
+        )
+        print("generated API token for script/CLI access (see /settings)")
     count = conn.execute("SELECT COUNT(*) FROM prospects").fetchone()[0]
     if count == 0 and os.path.exists(SEED_PATH):
         seed = json.load(open(SEED_PATH))
@@ -81,16 +97,78 @@ def init_db():
     conn.close()
 
 
+def get_api_token():
+    conn = db()
+    row = conn.execute("SELECT value FROM settings WHERE key='api_token'").fetchone()
+    conn.close()
+    return row["value"] if row and row["value"] else None
+
+
+def presented_token():
+    """API token from `Authorization: Bearer <t>` or `X-API-Token: <t>`, else None."""
+    ah = request.headers.get("Authorization", "")
+    if ah[:7].lower() == "bearer ":
+        t = ah[7:].strip()
+        if t:
+            return t
+    xt = request.headers.get("X-API-Token", "").strip()
+    return xt or None
+
+
+def auth_state():
+    """One of: open, basic, token, token_invalid, basic_invalid, none."""
+    if not PASSWORD:
+        return "open"
+    auth = request.authorization
+    if auth and auth.password and secrets.compare_digest(auth.password, PASSWORD):
+        return "basic"
+    tok = presented_token()
+    if tok is not None:
+        stored = get_api_token()
+        if stored and secrets.compare_digest(tok, stored):
+            return "token"
+        return "token_invalid"
+    if auth:
+        return "basic_invalid"
+    return "none"
+
+
+def _basic_challenge():
+    return Response("Login required", 401,
+                    {"WWW-Authenticate": 'Basic realm="tracker"'})
+
+
 def require_auth(f):
+    """Basic auth OR valid API token. No creds -> 401 challenge (browsers keep
+    working); a bad token presented -> 403 JSON (no challenge for API clients)."""
     @wraps(f)
     def wrapper(*args, **kwargs):
-        if PASSWORD:
-            auth = request.authorization
-            if not auth or auth.password != PASSWORD:
-                return Response("Login required", 401,
-                                {"WWW-Authenticate": 'Basic realm="tracker"'})
-        return f(*args, **kwargs)
+        state = auth_state()
+        if state in ("open", "basic", "token"):
+            return f(*args, **kwargs)
+        if state == "token_invalid":
+            return jsonify({"error": "invalid API token"}), 403
+        return _basic_challenge()
     return wrapper
+
+
+def require_basic_auth(f):
+    """Basic auth only (settings pages). Token-authenticated callers get 403."""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        state = auth_state()
+        if state in ("open", "basic"):
+            return f(*args, **kwargs)
+        if state in ("token", "token_invalid"):
+            return jsonify({"error": "this page requires basic auth"}), 403
+        return _basic_challenge()
+    return wrapper
+
+
+def wants_json():
+    if request.is_json:
+        return True
+    return "application/json" in request.headers.get("Accept", "")
 
 
 def log_activity(conn, prospect_id, kind, note):
@@ -198,8 +276,62 @@ def index():
 </form>
 <table><tr><th>Name</th><th>Company</th><th>Tier</th><th>Stage</th></tr>
 {"".join(trs)}</table>
-<p class="muted">{len(rows)} prospects</p>"""
+<p class="muted">{len(rows)} prospects</p>
+<p><a class="btn" href="/prospect/new">+ Add prospect</a> <a href="/settings">Settings</a></p>"""
     return page("Outreach tracker", body)
+
+
+@app.route("/prospect/new", methods=["GET", "POST"])
+@require_auth
+def new_prospect():
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        if not name:
+            return "Name is required", 400
+        stage = request.form.get("stage", "sourced")
+        if stage not in STAGES:
+            stage = "sourced"
+        conn = db()
+        now = datetime.now(timezone.utc).isoformat()
+        cur = conn.execute(
+            """INSERT INTO prospects
+               (name, company, title, tier, linkedin_url, email, stage,
+                source, planned_dm, notes, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (name, request.form.get("company", "").strip() or None,
+             request.form.get("title", "").strip() or None,
+             request.form.get("tier", "").strip() or None,
+             request.form.get("linkedin_url", "").strip() or None,
+             request.form.get("email", "").strip() or None,
+             stage,
+             request.form.get("source", "").strip() or None,
+             None, None, now, now),
+        )
+        pid = cur.lastrowid
+        note = request.form.get("note", "").strip()
+        if note:
+            log_activity(conn, pid, "note", note)
+        conn.commit()
+        conn.close()
+        return redirect(url_for("detail", pid=pid))
+    stage_opts = "".join(
+        f'<option value="{s}">{STAGE_LABELS[s]}</option>' for s in STAGES)
+    body = """
+<p><a href="/">&larr; All prospects</a></p>
+<h1>Add prospect</h1>
+<div class="card"><form method="post">
+<p>Name<br><input name="name" required style="width:100%"></p>
+<p>Company<br><input name="company" style="width:100%"></p>
+<p>Title<br><input name="title" style="width:100%"></p>
+<p>Tier (A/B/C, blank for non-outreach)<br><input name="tier" style="width:4em"></p>
+<p>LinkedIn URL<br><input name="linkedin_url" style="width:100%"></p>
+<p>Email<br><input name="email" style="width:100%"></p>
+<p>Stage<br><select name="stage">""" + stage_opts + """</select></p>
+<p>Source<br><input name="source" placeholder="e.g. founder-outreach, linkedin-audience-building" style="width:100%"></p>
+<p>Initial note<br><textarea name="note" rows="3" style="width:100%"></textarea></p>
+<p><button class="btn" type="submit">Add prospect</button></p>
+</form></div>"""
+    return page("Add prospect", body)
 
 
 @app.route("/prospect/<int:pid>")
@@ -250,13 +382,22 @@ def detail(pid):
 @app.route("/prospect/<int:pid>/stage", methods=["POST"])
 @require_auth
 def set_stage(pid):
-    stage = request.form.get("stage", "")
+    data = request.get_json(silent=True) if request.is_json else None
+    stage = ""
+    if isinstance(data, dict):
+        stage = data.get("stage", "") or ""
+    if not stage:
+        stage = request.form.get("stage", "")
     if stage not in STAGES:
+        if wants_json():
+            return jsonify({"error": "bad stage", "valid_stages": STAGES}), 400
         return "Bad stage", 400
     conn = db()
     r = conn.execute("SELECT stage FROM prospects WHERE id=?", (pid,)).fetchone()
     if not r:
         conn.close()
+        if wants_json():
+            return jsonify({"error": "prospect not found"}), 404
         return "Not found", 404
     old = r["stage"]
     conn.execute(
@@ -266,16 +407,32 @@ def set_stage(pid):
                  f"Stage: {STAGE_LABELS.get(old, old)} → {STAGE_LABELS[stage]}")
     conn.commit()
     conn.close()
+    if wants_json():
+        return jsonify({"ok": True, "id": pid, "stage": stage})
     return redirect(request.referrer or url_for("detail", pid=pid))
 
 
 @app.route("/prospect/<int:pid>/note", methods=["POST"])
 @require_auth
 def add_note(pid):
-    note = request.form.get("note", "").strip()
+    data = request.get_json(silent=True) if request.is_json else None
+    note = ""
+    if isinstance(data, dict):
+        note = data.get("note", "") or ""
     if not note:
+        note = request.form.get("note", "")
+    note = note.strip()
+    if not note:
+        if wants_json():
+            return jsonify({"error": "note is required"}), 400
         return redirect(url_for("detail", pid=pid))
     conn = db()
+    exists = conn.execute("SELECT id FROM prospects WHERE id=?", (pid,)).fetchone()
+    if not exists:
+        conn.close()
+        if wants_json():
+            return jsonify({"error": "prospect not found"}), 404
+        return "Not found", 404
     conn.execute(
         "UPDATE prospects SET notes=CASE WHEN notes IS NULL OR notes='' THEN ? "
         "ELSE notes || '\n\n' || ? END, updated_at=? WHERE id=?",
@@ -283,6 +440,8 @@ def add_note(pid):
     log_activity(conn, pid, "note", note)
     conn.commit()
     conn.close()
+    if wants_json():
+        return jsonify({"ok": True, "id": pid})
     return redirect(url_for("detail", pid=pid))
 
 
@@ -293,6 +452,61 @@ def api_prospects():
     rows = conn.execute("SELECT * FROM prospects ORDER BY id").fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/prospect/<int:pid>")
+@require_auth
+def api_prospect(pid):
+    conn = db()
+    r = conn.execute("SELECT * FROM prospects WHERE id=?", (pid,)).fetchone()
+    conn.close()
+    if not r:
+        return jsonify({"error": "prospect not found"}), 404
+    return jsonify(dict(r))
+
+
+def render_settings(new_token=None):
+    token = new_token or get_api_token() or ""
+    banner = ""
+    if new_token:
+        banner = ('<div class="card" style="border:2px solid #0a66c2">'
+                  "<h3>New API token</h3>"
+                  "<p>Copy it now. It is shown in full only this once.</p>"
+                  f'<p><code style="font-size:15px;word-break:break-all">'
+                  f"{new_token}</code></p></div>")
+    body = f"""
+<p><a href="/">&larr; All prospects</a></p>
+<h1>Settings</h1>
+{banner}
+<div class="card"><h3>API token</h3>
+<p class="muted">For scripts and CLIs. Send it as
+<code>Authorization: Bearer &lt;token&gt;</code> or
+<code>X-API-Token: &lt;token&gt;</code>.</p>
+<p><code id="apitok" data-tok="{token}" data-hidden="1">{"•" * 20}</code>
+<button class="btn btn-ghost" type="button" onclick="var e=document.getElementById('apitok');if(e.getAttribute('data-hidden')){{e.textContent=e.getAttribute('data-tok');e.removeAttribute('data-hidden');}}else{{e.textContent='{"•" * 20}';e.setAttribute('data-hidden','1');}}">Reveal</button></p>
+<form method="post" action="/settings/rotate" onsubmit="return confirm('Rotate the API token? The old token stops working immediately.');">
+<button class="btn" type="submit">Rotate token</button></form></div>"""
+    return page("Settings", body)
+
+
+@app.route("/settings")
+@require_basic_auth
+def settings():
+    return render_settings()
+
+
+@app.route("/settings/rotate", methods=["POST"])
+@require_basic_auth
+def rotate_token():
+    new_token = secrets.token_urlsafe(32)
+    conn = db()
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('api_token', ?)",
+        (new_token,),
+    )
+    conn.commit()
+    conn.close()
+    return render_settings(new_token=new_token)
 
 
 @app.route("/healthz")
